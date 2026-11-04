@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -41,7 +44,12 @@ jobs:
           zip -qr BTFileShare.ipa Payload
           rm -rf Payload
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: BTFileShare-ipa
-          path: BTFileShare.ipa
+      - name: Publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" BTFileShare.ipa \
+            --repo "${{ github.repository }}" \
+            --title "BT Share $TAG" \
+            --notes "Автосборка из коммита ${{ github.sha }}"
