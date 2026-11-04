@@ -19,5 +19,4 @@ targets:
       properties:
         CFBundleDisplayName: BT Share
         UILaunchScreen: {}
-        NSBluetoothAlwaysUsageDescription: "Передача файлов между устройствами по Bluetooth"
-        NSBluetoothPeripheralUsageDescription: "Приём файлов от другого устройства по Bluetooth"
+        NSLocalNetworkUsageDescription: "Поиск устройств и передача файлов по Wi-Fi"
