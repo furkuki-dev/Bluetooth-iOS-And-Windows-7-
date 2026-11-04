@@ -1,91 +1,162 @@
 import CoreBluetooth
 import Foundation
 
+struct NearbyDevice: Identifiable {
+    let id: UUID
+    let name: String
+    let peripheral: CBPeripheral
+}
+
 final class SenderManager: NSObject, ObservableObject {
-    @Published var status = "Выберите файл"
+    @Published var status = "Ожидание Bluetooth…"
+    @Published var devices: [NearbyDevice] = []
+    @Published var isScanning = false
+    @Published var isSending = false
     @Published var progress: Double = 0
-    @Published var isBusy = false
 
     private var central: CBCentralManager!
-    private var peripheral: CBPeripheral?
-    private var characteristic: CBCharacteristic?
+    private var wantsScan = false
 
-    private var fileData = Data()
-    private var fileName = ""
+    private var target: CBPeripheral?
+    private var characteristic: CBCharacteristic?
+    private var attemptID: UUID?
+
+    private var queue: [(name: String, data: Data)] = []
+    private var fileIndex = 0
     private var offset = 0
+    private var phase: Phase = .header
+    private var totalBytes = 0
+    private var sentBytes = 0
     private var chunkSize = 100
-    private var headerSent = false
-    private var endSent = false
+
+    private enum Phase { case header, data }
 
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
-    func send(data: Data, name: String) {
-        guard !isBusy else { return }
-        guard !data.isEmpty else { status = "Файл пустой"; return }
+    // MARK: - Публичный API
+
+    func startScan() {
+        wantsScan = true
+        guard central.state == .poweredOn else {
+            status = "Включите Bluetooth"
+            return
+        }
+        if !isSending { status = "Поиск устройств…" }
+        beginScan()
+    }
+
+    func stopScan() {
+        wantsScan = false
+        central.stopScan()
+        isScanning = false
+    }
+
+    func send(files: [(name: String, data: Data)], to device: NearbyDevice) {
+        guard !isSending else { return }
         guard central.state == .poweredOn else { status = "Включите Bluetooth"; return }
 
-        fileData = data
-        fileName = name
+        let nonEmpty = files.filter { !$0.data.isEmpty }
+        guard !nonEmpty.isEmpty else { status = "Файлы пустые"; return }
+
+        // Во время передачи поиск не нужен
+        central.stopScan()
+        isScanning = false
+
+        queue = nonEmpty
+        totalBytes = nonEmpty.reduce(0) { $0 + $1.data.count }
+        sentBytes = 0
+        fileIndex = 0
         offset = 0
-        headerSent = false
-        endSent = false
+        phase = .header
         progress = 0
-        isBusy = true
-        status = "Поиск получателя…"
+        isSending = true
+        target = device.peripheral
+        characteristic = nil
+        device.peripheral.delegate = self
+        status = "Подключение к \(device.name)…"
+        central.connect(device.peripheral, options: nil)
 
-        central.scanForPeripherals(withServices: [BTConstants.serviceUUID], options: nil)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self = self, self.isBusy, self.peripheral == nil else { return }
-            self.fail("Получатель не найден")
+        // Если устройство не ответило за 20 секунд, сдаёмся
+        let attempt = UUID()
+        attemptID = attempt
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, self.isSending, self.attemptID == attempt, self.characteristic == nil else { return }
+            self.fail("Устройство не ответило. Проверьте, что на нём открыт режим «Принять»")
         }
     }
 
-    private func fail(_ message: String) {
+    // MARK: - Внутреннее
+
+    private func beginScan() {
+        guard central.state == .poweredOn, !isSending else { return }
         central.stopScan()
-        if let p = peripheral { central.cancelPeripheralConnection(p) }
-        peripheral = nil
+        devices.removeAll()
+        central.scanForPeripherals(withServices: [BTConstants.serviceUUID], options: nil)
+        isScanning = true
+    }
+
+    private func resetSession() {
+        target = nil
         characteristic = nil
-        isBusy = false
+        queue = []
+        attemptID = nil
+        isSending = false
+    }
+
+    private func fail(_ message: String) {
+        let p = target
+        resetSession()
+        progress = 0
         status = message
+        if let p { central.cancelPeripheralConnection(p) }
+        if wantsScan { beginScan() }
     }
 
     private func finishSuccess() {
-        if let p = peripheral { central.cancelPeripheralConnection(p) }
-        peripheral = nil
-        characteristic = nil
-        isBusy = false
+        let count = queue.count
+        let p = target
+        resetSession()
         progress = 1
-        status = "Файл «\(fileName)» отправлен"
+        status = "Отправлено файлов: \(count)"
+        if let p { central.cancelPeripheralConnection(p) }
+        if wantsScan { beginScan() }
     }
 
     /// Отправляет следующий пакет. Вызывается из didWriteValueFor,
     /// поэтому запись идёт строго по одному пакету (write with response).
     private func sendNext() {
-        guard let p = peripheral, let ch = characteristic else { return }
+        guard let p = target, let ch = characteristic else { return }
+        guard fileIndex < queue.count else { finishSuccess(); return }
 
+        let file = queue[fileIndex]
         let packet: Data
-        if !headerSent {
-            guard let json = try? JSONEncoder().encode(FileHeader(name: fileName, size: fileData.count)) else {
+
+        switch phase {
+        case .header:
+            guard let json = try? JSONEncoder().encode(FileHeader(name: file.name, size: file.data.count)) else {
                 fail("Ошибка заголовка")
                 return
             }
             packet = makePacket(.header, json)
-            headerSent = true
-        } else if offset < fileData.count {
-            let end = min(offset + chunkSize, fileData.count)
-            packet = makePacket(.data, fileData[offset..<end])
-            offset = end
-            progress = Double(offset) / Double(fileData.count)
-        } else if !endSent {
-            packet = makePacket(.end)
-            endSent = true
-        } else {
-            finishSuccess()
-            return
+            phase = .data
+            offset = 0
+            status = "Отправка «\(file.name)» (\(fileIndex + 1) из \(queue.count))"
+
+        case .data:
+            if offset < file.data.count {
+                let end = min(offset + chunkSize, file.data.count)
+                packet = makePacket(.data, file.data[offset..<end])
+                sentBytes += end - offset
+                offset = end
+                progress = Double(sentBytes) / Double(totalBytes)
+            } else {
+                packet = makePacket(.end)
+                fileIndex += 1
+                phase = .header
+            }
         }
 
         p.writeValue(packet, for: ch, type: .withResponse)
@@ -96,8 +167,18 @@ final class SenderManager: NSObject, ObservableObject {
 
 extension SenderManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        if central.state != .poweredOn && isBusy {
-            fail("Bluetooth выключен")
+        switch central.state {
+        case .poweredOn:
+            if wantsScan { beginScan() }
+        case .poweredOff:
+            isScanning = false
+            devices.removeAll()
+            status = "Включите Bluetooth"
+            if isSending { fail("Bluetooth выключен") }
+        case .unauthorized:
+            status = "Нет доступа к Bluetooth в настройках"
+        default:
+            break
         }
     }
 
@@ -105,11 +186,11 @@ extension SenderManager: CBCentralManagerDelegate {
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
-        central.stopScan()
-        self.peripheral = peripheral
-        peripheral.delegate = self
-        status = "Подключение…"
-        central.connect(peripheral, options: nil)
+        guard !devices.contains(where: { $0.id == peripheral.identifier }) else { return }
+        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
+            ?? peripheral.name
+            ?? "Устройство"
+        devices.append(NearbyDevice(id: peripheral.identifier, name: name, peripheral: peripheral))
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -120,13 +201,13 @@ extension SenderManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
-        fail("Не удалось подключиться")
+        if isSending { fail("Не удалось подключиться") }
     }
 
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        if isBusy { fail("Соединение разорвано") }
+        if isSending { fail("Соединение разорвано") }
     }
 }
 
@@ -151,7 +232,6 @@ extension SenderManager: CBPeripheralDelegate {
             return
         }
         characteristic = ch
-        // Один байт уходит на тип пакета
         chunkSize = max(20, peripheral.maximumWriteValueLength(for: .withResponse) - 1)
         status = "Отправка…"
         sendNext()
@@ -160,7 +240,7 @@ extension SenderManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didWriteValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        if let error = error {
+        if let error {
             fail("Ошибка записи: \(error.localizedDescription)")
             return
         }

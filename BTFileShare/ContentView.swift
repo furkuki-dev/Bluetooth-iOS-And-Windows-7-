@@ -1,5 +1,5 @@
 import SwiftUI
-import UniformTypeIdentifiers
+import UIKit
 
 struct ContentView: View {
     enum Mode: String, CaseIterable {
@@ -11,14 +11,11 @@ struct ContentView: View {
     @StateObject private var receiver = ReceiverManager()
 
     @State private var mode: Mode = .send
-    @State private var showImporter = false
-    @State private var pickedName: String?
-    @State private var pickedData: Data?
-    @State private var loadError: String?
+    @State private var message: String?
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
+            VStack(spacing: 20) {
                 Picker("Режим", selection: $mode) {
                     ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
@@ -29,59 +26,81 @@ struct ContentView: View {
                 } else {
                     receivePanel
                 }
-
-                Spacer()
             }
             .padding()
             .navigationTitle("BT Share")
-            // Импортер на корневом view, а не внутри условной ветки
-            .fileImporter(
-                isPresented: $showImporter,
-                allowedContentTypes: [.data],
-                allowsMultipleSelection: false
-            ) { result in
-                handleImport(result)
+            .onAppear { activate(mode) }
+            .onChange(of: mode) { newMode in activate(newMode) }
+            .onDisappear {
+                receiver.stop()
+                sender.stopScan()
             }
-            .onChange(of: mode) { newMode in
-                if newMode == .receive {
-                    receiver.start()
-                } else {
-                    receiver.stop()
-                }
-            }
-            .onDisappear { receiver.stop() }
         }
     }
 
-    private var sendPanel: some View {
-        VStack(spacing: 16) {
-            Button {
-                loadError = nil
-                showImporter = true
-            } label: {
-                Label(pickedName ?? "Выбрать файл", systemImage: "doc")
-                    .lineLimit(1)
-            }
-            .buttonStyle(.bordered)
-            .disabled(sender.isBusy)
+    private func activate(_ newMode: Mode) {
+        if newMode == .send {
+            receiver.stop()
+            sender.startScan()
+        } else {
+            sender.stopScan()
+            receiver.start()
+        }
+    }
 
-            if let loadError {
-                Text(loadError)
+    // MARK: - Отправка
+
+    private var sendPanel: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("Устройства рядом")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    message = nil
+                    sender.startScan()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(sender.isSending)
+            }
+
+            if sender.devices.isEmpty {
+                if sender.isScanning {
+                    ProgressView()
+                }
+                Text("Попросите получателя открыть режим «Принять»")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Spacer()
+            } else {
+                List(sender.devices) { device in
+                    Button {
+                        pick(for: device)
+                    } label: {
+                        HStack {
+                            Image(systemName: "iphone")
+                            Text(device.name)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .disabled(sender.isSending)
+                }
+                .listStyle(.plain)
+            }
+
+            if sender.isSending {
+                ProgressView(value: sender.progress)
+            }
+
+            if let message {
+                Text(message)
                     .foregroundStyle(.red)
                     .font(.footnote)
                     .multilineTextAlignment(.center)
-            }
-
-            Button("Отправить") {
-                if let data = pickedData, let name = pickedName {
-                    sender.send(data: data, name: name)
-                }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(pickedData == nil || sender.isBusy)
-
-            if sender.isBusy {
-                ProgressView(value: sender.progress)
             }
 
             Text(sender.status)
@@ -89,6 +108,33 @@ struct ContentView: View {
                 .multilineTextAlignment(.center)
         }
     }
+
+    /// Выбор телефона открывает выбор файлов, после выбора файлы уходят на этот телефон
+    private func pick(for device: NearbyDevice) {
+        message = nil
+        DocPicker.present { urls in
+            guard !urls.isEmpty else { return }
+            if let files = readFiles(urls) {
+                sender.send(files: files, to: device)
+            }
+        }
+    }
+
+    private func readFiles(_ urls: [URL]) -> [(name: String, data: Data)]? {
+        var result: [(name: String, data: Data)] = []
+        for url in urls {
+            do {
+                let data = try Data(contentsOf: url)
+                result.append((name: url.lastPathComponent, data: data))
+            } catch {
+                message = "Не удалось прочитать «\(url.lastPathComponent)»"
+                return nil
+            }
+        }
+        return result
+    }
+
+    // MARK: - Приём
 
     private var receivePanel: some View {
         VStack(spacing: 16) {
@@ -103,53 +149,55 @@ struct ContentView: View {
                 ProgressView(value: receiver.progress)
             }
 
-            if let url = receiver.receivedURL {
+            ForEach(receiver.received, id: \.self) { url in
                 ShareLink(item: url) {
                     Label(url.lastPathComponent, systemImage: "square.and.arrow.up")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
             }
+
+            Spacer()
         }
     }
+}
 
-    private func handleImport(_ result: Result<[URL], Error>) {
-        switch result {
-        case .failure(let error):
-            loadError = "Выбор не выполнен: \(error.localizedDescription)"
-        case .success(let urls):
-            guard let url = urls.first else { return }
-            readFile(at: url)
+// MARK: - Системный выбор файлов через UIKit
+
+enum DocPicker {
+    // Держим делегат, пока открыт пикер
+    private static var delegate: Delegate?
+
+    static func present(_ onPick: @escaping ([URL]) -> Void) {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first,
+              let window = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first,
+              var top = window.rootViewController else { return }
+        while let presented = top.presentedViewController {
+            top = presented
         }
+
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        picker.allowsMultipleSelection = true
+
+        let d = Delegate(onPick)
+        delegate = d
+        picker.delegate = d
+        top.present(picker, animated: true)
     }
 
-    private func readFile(at url: URL) {
-        let accessed = url.startAccessingSecurityScopedResource()
-        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+    private final class Delegate: NSObject, UIDocumentPickerDelegate {
+        let handler: ([URL]) -> Void
 
-        var coordError: NSError?
-        var data: Data?
-        var readError: Error?
-
-        // Координатор нужен для файлов iCloud Drive, которые могут быть не загружены локально
-        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordError) { newURL in
-            do {
-                data = try Data(contentsOf: newURL)
-            } catch {
-                readError = error
-            }
+        init(_ handler: @escaping ([URL]) -> Void) {
+            self.handler = handler
         }
 
-        if let error = coordError ?? readError {
-            loadError = "Не удалось прочитать файл: \(error.localizedDescription)"
-            return
-        }
-        guard let data, !data.isEmpty else {
-            loadError = "Файл пустой или недоступен"
-            return
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            handler(urls)
         }
 
-        pickedData = data
-        pickedName = url.lastPathComponent
-        loadError = nil
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            handler([])
+        }
     }
 }

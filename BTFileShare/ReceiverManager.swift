@@ -4,7 +4,11 @@ import Foundation
 final class ReceiverManager: NSObject, ObservableObject {
     @Published var status = "Выключено"
     @Published var progress: Double = 0
-    @Published var receivedURL: URL?
+    @Published var received: [URL] = []
+
+    // С iOS 16 UIDevice.name отдаёт общее «iPhone», поэтому используем короткую метку.
+    // Имя должно быть коротким: BLE-реклама вмещает его вместе с UUID сервиса.
+    private let advertisedName = "BT-" + String(UUID().uuidString.prefix(4))
 
     private var manager: CBPeripheralManager!
     private var wantsRunning = false
@@ -19,9 +23,9 @@ final class ReceiverManager: NSObject, ObservableObject {
 
     func start() {
         wantsRunning = true
-        receivedURL = nil
+        received = []
         progress = 0
-        status = "Ожидание…"
+        status = "Ожидание отправителя…"
         if manager.state == .poweredOn { setupService() }
     }
 
@@ -97,7 +101,7 @@ final class ReceiverManager: NSObject, ObservableObject {
             }
             try buffer.write(to: url)
 
-            receivedURL = url
+            received.append(url)
             progress = 1
             status = "Получен «\(fileName)»"
             return true
@@ -127,18 +131,18 @@ extension ReceiverManager: CBPeripheralManagerDelegate {
     func peripheralManager(_ peripheral: CBPeripheralManager,
                            didAdd service: CBService,
                            error: Error?) {
-        if let error = error {
+        if let error {
             status = "Ошибка сервиса: \(error.localizedDescription)"
             return
         }
         peripheral.startAdvertising([
             CBAdvertisementDataServiceUUIDsKey: [BTConstants.serviceUUID],
-            CBAdvertisementDataLocalNameKey: "BTShare"
+            CBAdvertisementDataLocalNameKey: advertisedName
         ])
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
-        if let error = error {
+        if let error {
             status = "Ошибка рекламы: \(error.localizedDescription)"
         } else {
             status = "Ожидание отправителя…"
