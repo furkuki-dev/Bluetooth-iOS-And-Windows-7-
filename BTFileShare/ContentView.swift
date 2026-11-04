@@ -34,6 +34,14 @@ struct ContentView: View {
             }
             .padding()
             .navigationTitle("BT Share")
+            // Импортер на корневом view, а не внутри условной ветки
+            .fileImporter(
+                isPresented: $showImporter,
+                allowedContentTypes: [.data],
+                allowsMultipleSelection: false
+            ) { result in
+                handleImport(result)
+            }
             .onChange(of: mode) { newMode in
                 if newMode == .receive {
                     receiver.start()
@@ -48,9 +56,11 @@ struct ContentView: View {
     private var sendPanel: some View {
         VStack(spacing: 16) {
             Button {
+                loadError = nil
                 showImporter = true
             } label: {
                 Label(pickedName ?? "Выбрать файл", systemImage: "doc")
+                    .lineLimit(1)
             }
             .buttonStyle(.bordered)
             .disabled(sender.isBusy)
@@ -59,6 +69,7 @@ struct ContentView: View {
                 Text(loadError)
                     .foregroundStyle(.red)
                     .font(.footnote)
+                    .multilineTextAlignment(.center)
             }
 
             Button("Отправить") {
@@ -76,9 +87,6 @@ struct ContentView: View {
             Text(sender.status)
                 .font(.subheadline)
                 .multilineTextAlignment(.center)
-        }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item]) { result in
-            loadFile(result)
         }
     }
 
@@ -104,17 +112,44 @@ struct ContentView: View {
         }
     }
 
-    private func loadFile(_ result: Result<URL, Error>) {
-        do {
-            let url = try result.get()
-            let accessed = url.startAccessingSecurityScopedResource()
-            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-
-            pickedData = try Data(contentsOf: url)
-            pickedName = url.lastPathComponent
-            loadError = nil
-        } catch {
-            loadError = "Не удалось прочитать файл"
+    private func handleImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure(let error):
+            loadError = "Выбор не выполнен: \(error.localizedDescription)"
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            readFile(at: url)
         }
+    }
+
+    private func readFile(at url: URL) {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+
+        var coordError: NSError?
+        var data: Data?
+        var readError: Error?
+
+        // Координатор нужен для файлов iCloud Drive, которые могут быть не загружены локально
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordError) { newURL in
+            do {
+                data = try Data(contentsOf: newURL)
+            } catch {
+                readError = error
+            }
+        }
+
+        if let error = coordError ?? readError {
+            loadError = "Не удалось прочитать файл: \(error.localizedDescription)"
+            return
+        }
+        guard let data, !data.isEmpty else {
+            loadError = "Файл пустой или недоступен"
+            return
+        }
+
+        pickedData = data
+        pickedName = url.lastPathComponent
+        loadError = nil
     }
 }
