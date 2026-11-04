@@ -1,0 +1,23 @@
+name: BTFileShare
+options:
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  BTFileShare:
+    type: application
+    platform: iOS
+    sources: [BTFileShare]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.werty.btfileshare
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "5.0"
+    info:
+      path: BTFileShare/Info.plist
+      properties:
+        CFBundleDisplayName: BT Share
+        UILaunchScreen: {}
+        NSBluetoothAlwaysUsageDescription: "Передача файлов между устройствами по Bluetooth"
+        NSBluetoothPeripheralUsageDescription: "Приём файлов от другого устройства по Bluetooth"
